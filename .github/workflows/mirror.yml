@@ -26,6 +26,10 @@ on:
         description: "Raise upstream's iOS/tvOS 13.0 and macOS 10.15 floors. Only needed when the local Xcode refuses them"
         type: boolean
         default: false
+      tag_suffix:
+        description: "Appended to the version tag, e.g. -cosmic.1 when this mirror carries source patches upstream does not"
+        required: false
+        default: ""
       publish:
         description: "Commit, tag and push. Unchecked builds and verifies only"
         type: boolean
@@ -176,7 +180,7 @@ jobs:
         working-directory: mirror
         run: |
           set -euo pipefail
-          TAG="v${PKG_VERSION}"
+          TAG="v${PKG_VERSION}${{ inputs.tag_suffix }}"
 
           # Partners pin tags, so a tag is written once and never moved. Bump the
           # upstream version, or delete the tag deliberately, to republish.
