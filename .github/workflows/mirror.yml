@@ -1,0 +1,187 @@
+name: Mirror
+
+# Builds Apple's GameKit plug-in from source and publishes it into this repo as a
+# UPM package, tagged v<version>. Apple ships no releases and no registry listing,
+# so the only way to consume these plug-ins is to compile the native libraries —
+# which needs Xcode and a Mac. That is what this workflow is.
+#
+# Runs on the self-hosted macOS runners (Astra / Anubis), which carry Xcode 26.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "apple/unityplugins tag to build from"
+        required: true
+        default: "GameKit-4.0.1"
+      platforms:
+        description: "build.py platforms. macOS is omitted on purpose — see README"
+        required: true
+        default: "iOS iPhoneSimulator tvOS AppleTVSimulator"
+      xcode_app:
+        description: "Xcode to build with. Must be a released Xcode, never a beta"
+        required: true
+        default: "/Applications/Xcode.app"
+      raise_deployment_targets:
+        description: "Raise upstream's iOS/tvOS 13.0 and macOS 10.15 floors. Only needed when the local Xcode refuses them"
+        type: boolean
+        default: false
+      publish:
+        description: "Commit, tag and push. Unchecked builds and verifies only"
+        type: boolean
+        default: true
+
+concurrency:
+  group: mirror-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  PACKAGE: com.apple.unityplugin.gamekit
+  # GameKit's native target links against Apple.Core's, so both are built here.
+  PLUGINS: Core GameKit
+
+jobs:
+  mirror:
+    name: Build and publish
+    runs-on: macOS
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out this mirror
+        uses: actions/checkout@v4
+        with:
+          path: mirror
+          fetch-depth: 0   # tags, so an existing version can be refused
+
+      - name: Check out apple/unityplugins
+        uses: actions/checkout@v4
+        with:
+          repository: apple/unityplugins
+          ref: ${{ inputs.upstream_tag }}
+          path: upstream
+
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          APP="${{ inputs.xcode_app }}"
+          [ -d "$APP" ] || { echo "::error::$APP not found on $(hostname)"; exit 1; }
+
+          DEVELOPER_DIR="$APP/Contents/Developer"
+          VERSION="$(DEVELOPER_DIR="$DEVELOPER_DIR" xcodebuild -version | head -1)"
+          echo "$VERSION on $(hostname)"
+
+          # Partner games ship these binaries. Apple can reject App Store
+          # submissions containing anything built with beta tooling, and the beta
+          # SDK also drifts ahead of Apple's own plug-in source: the iOS 27 beta
+          # SDK added a GKGameActivityListener requirement that GameKit 4.0.1
+          # does not implement, which fails this build outright.
+          case "$APP $VERSION" in
+            *[Bb]eta*)
+              echo "::error::$VERSION is a beta Xcode — build the mirror with a released Xcode"
+              exit 1
+              ;;
+          esac
+
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
+          echo "XCODE_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Raise deployment targets
+        if: ${{ inputs.raise_deployment_targets }}
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          # Newer Xcodes refuse upstream's floors (Xcode 27 wants iOS/tvOS >= 15,
+          # macOS >= 12). Unity 6000.5 defaults to iOS/tvOS 15 anyway, so this
+          # costs partner games nothing — but it is a deviation, so it is opt-in
+          # and recorded in the commit message.
+          sed -i '' -E \
+            -e 's/(IPHONEOS_DEPLOYMENT_TARGET) = 1[0-4](\.[0-9]+)?/\1 = 15.0/g' \
+            -e 's/(TVOS_DEPLOYMENT_TARGET) = 1[0-4](\.[0-9]+)?/\1 = 15.0/g' \
+            -e 's/(MACOSX_DEPLOYMENT_TARGET) = (10\.[0-9]+|11(\.[0-9]+)?)/\1 = 12.0/g' \
+            plug-ins/Apple.Core/Native/AppleCoreNative.xcodeproj/project.pbxproj \
+            plug-ins/Apple.GameKit/Native/GameKitWrapper.xcodeproj/project.pbxproj
+          echo "DEPLOYMENT_PATCH=raised to iOS/tvOS 15.0, macOS 12.0" >> "$GITHUB_ENV"
+
+      - name: Build and pack
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          # No stdin on purpose: build.py prompts "continue?" after a failed
+          # scheme. With /dev/null it raises instead, so a partial build fails
+          # the job rather than quietly packing a package with missing slices.
+          python3 build.py \
+            -p ${{ env.PLUGINS }} \
+            -m ${{ inputs.platforms }} \
+            -bc Release -b build pack -nc < /dev/null
+          ls -la Build/
+
+      - name: Stage and verify the package
+        run: |
+          set -euo pipefail
+          TGZ="$(ls upstream/Build/${PACKAGE}-*.tgz)"
+          VERSION="$(basename "$TGZ" .tgz)"; VERSION="${VERSION#${PACKAGE}-}"
+
+          rm -rf staging && mkdir staging
+          tar xzf "$TGZ" -C staging          # unpacks to staging/package
+          PKG=staging/package
+
+          [ -f "$PKG/package.json" ] || { echo "::error::$TGZ has no package.json"; exit 1; }
+          MANIFEST_VERSION="$(python3 -c 'import json;print(json.load(open("'"$PKG"'/package.json"))["version"])')"
+          [ "$MANIFEST_VERSION" = "$VERSION" ] || { echo "::error::tarball says $VERSION, package.json says $MANIFEST_VERSION"; exit 1; }
+
+          # A package that packs but carries no native libraries links against
+          # nothing on device — the failure would surface in a partner's Xcode.
+          for platform in ${{ inputs.platforms }}; do
+            [ -d "$PKG/NativeLibraries~/Release/$platform" ] || {
+              echo "::error::no native libraries for $platform in $TGZ"; exit 1; }
+          done
+
+          # Upstream's test assembly references com.unity.test-framework, which a
+          # partner project need not have installed; without it the assembly fails
+          # to compile and takes the project's console with it.
+          rm -rf "$PKG/Tests" "$PKG/Tests.meta"
+
+          echo "PKG_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "### $PACKAGE $VERSION" >> "$GITHUB_STEP_SUMMARY"
+          echo "- upstream \`${{ inputs.upstream_tag }}\`, $XCODE_VERSION on $(hostname)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- platforms: ${{ inputs.platforms }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit and tag
+        working-directory: mirror
+        run: |
+          set -euo pipefail
+          TAG="v${PKG_VERSION}"
+
+          # Partners pin tags, so a tag is written once and never moved. Bump the
+          # upstream version, or delete the tag deliberately, to republish.
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::$TAG already exists — tags are pinned by partners and never move"
+            exit 1
+          fi
+
+          rsync -a --delete \
+            --exclude .git --exclude .github --exclude README.md \
+            ../staging/package/ ./
+
+          git config user.name "cosmic-ci"
+          git config user.email "ci@cosmicpulse.tech"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "::error::nothing changed — this build matches what is already published"
+            exit 1
+          fi
+
+          git commit \
+            -m "$PACKAGE $PKG_VERSION from ${{ inputs.upstream_tag }}" \
+            -m "Built on $(hostname) with $XCODE_VERSION
+          Platforms: ${{ inputs.platforms }}
+          ${DEPLOYMENT_PATCH:-Deployment targets: upstream defaults}"
+          git tag -a "$TAG" -m "$PACKAGE $PKG_VERSION"
+
+          if [ "${{ inputs.publish }}" != "true" ]; then
+            echo "Dry run — built and verified, nothing pushed."
+            exit 0
+          fi
+          git push origin "HEAD:${{ github.ref_name }}"
+          git push origin "$TAG"
