@@ -68,7 +68,10 @@ jobs:
           [ -d "$APP" ] || { echo "::error::$APP not found on $(hostname)"; exit 1; }
 
           DEVELOPER_DIR="$APP/Contents/Developer"
-          VERSION="$(DEVELOPER_DIR="$DEVELOPER_DIR" xcodebuild -version | head -1)"
+          # Capture in full before trimming: piping xcodebuild straight into head
+          # closes the pipe under it, and it aborts on SIGPIPE (exit 134).
+          XCODEBUILD_OUT="$(DEVELOPER_DIR="$DEVELOPER_DIR" xcodebuild -version)"
+          VERSION="$(printf '%s\n' "$XCODEBUILD_OUT" | head -1)"
           echo "$VERSION on $(hostname)"
 
           # Partner games ship these binaries. Apple can reject App Store
