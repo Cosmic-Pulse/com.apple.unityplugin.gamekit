@@ -110,13 +110,26 @@ jobs:
         working-directory: upstream
         run: |
           set -euo pipefail
-          # No stdin on purpose: build.py prompts "continue?" after a failed
-          # scheme. With /dev/null it raises instead, so a partial build fails
-          # the job rather than quietly packing a package with missing slices.
-          python3 build.py \
+          LOG="$RUNNER_TEMP/build.log"
+
+          # build.py prompts twice: to confirm a skipped platform, and to offer
+          # continuing after a scheme fails. Answering "n" to both declines macOS
+          # and stops a partial build. It stops by returning 0 with nothing packed,
+          # though, so the exit code alone proves nothing — hence the log check
+          # below and the package verification in the next step.
+          set +e
+          yes n | python3 build.py \
             -p ${{ env.PLUGINS }} \
             -m ${{ inputs.platforms }} \
-            -bc Release -b build pack -nc < /dev/null
+            -bc Release -b build pack -nc 2>&1 | tee "$LOG"
+          status=${PIPESTATUS[1]}
+          set -e
+
+          if grep -q "build commands failed" "$LOG"; then
+            echo "::error::a native build failed — see the log above"
+            exit 1
+          fi
+          [ "$status" -eq 0 ] || exit "$status"
           ls -la Build/
 
       - name: Stage and verify the package
