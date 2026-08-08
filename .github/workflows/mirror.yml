@@ -15,9 +15,9 @@ on:
         required: true
         default: "GameKit-4.0.1"
       platforms:
-        description: "build.py platforms. macOS is omitted on purpose — see README"
+        description: "build.py platforms. macOS and tvOS are omitted on purpose — see README"
         required: true
-        default: "iOS iPhoneSimulator tvOS AppleTVSimulator"
+        default: "iOS iPhoneSimulator"
       xcode_app:
         description: "Xcode to build with. Must be a released Xcode, never a beta"
         required: true
@@ -127,6 +127,15 @@ jobs:
 
           if grep -q "build commands failed" "$LOG"; then
             echo "::error::a native build failed — see the log above"
+            exit 1
+          fi
+          # A platform whose Xcode component is missing yields "ineligible
+          # destinations" rather than a failed command, and build.py then just
+          # asks whether to carry on. Left undetected it packs nothing and the
+          # failure surfaces later as a missing tarball.
+          if grep -q "Ineligible destinations" "$LOG"; then
+            echo "::error::a requested platform has no Xcode component installed on $(hostname) — install it (Xcode > Settings > Components) or drop it from the platforms input"
+            grep -A2 "Ineligible destinations" "$LOG" | head -20
             exit 1
           fi
           [ "$status" -eq 0 ] || exit "$status"
