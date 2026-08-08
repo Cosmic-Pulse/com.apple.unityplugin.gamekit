@@ -197,15 +197,16 @@ jobs:
           git config user.email "ci@cosmicpulse.tech"
           git add -A
           if git diff --cached --quiet; then
-            echo "::error::nothing changed — this build matches what is already published"
-            exit 1
-          fi
-
-          git commit \
+            # A rebuild that reproduces the published bytes is the good case, not
+            # an error — it just means this run only needs to add the tag.
+            echo "Content matches what is already published; tagging $TAG on HEAD."
+          else
+            git commit \
             -m "$PACKAGE $PKG_VERSION from ${{ inputs.upstream_tag }}" \
             -m "Built on $(hostname) with $XCODE_VERSION
           Platforms: ${{ inputs.platforms }}
           ${DEPLOYMENT_PATCH:-Deployment targets: upstream defaults}"
+          fi
           git tag -a "$TAG" -m "$PACKAGE $PKG_VERSION"
 
           if [ "${{ inputs.publish }}" != "true" ]; then
